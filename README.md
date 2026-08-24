@@ -1,6 +1,3 @@
-Here is the complete `README.md` content:
-
-````markdown
 # FinMan
 
 FinMan is an AI-powered personal finance assistant that helps users analyze their bank statements and understand their spending.
@@ -103,5 +100,3 @@ npm run dev
 🚧 FinMan is currently under development.
 
 More features, improvements, and documentation will be added as the project progresses.
-
-````
