@@ -254,54 +254,60 @@ def extract_transaction_table(
     Extract the transaction rows from a statement.
 
     Metadata above the transaction table is ignored.
+    Footer/note rows after the transaction table are also ignored.
 
-    Original column names are preserved because
-    Gemini will perform the final semantic mapping.
+    A valid transaction row must contain a parseable date in
+    the detected date column.
     """
 
-    header_info = (
-        detect_transaction_header(df)
-    )
+    header_info = detect_transaction_header(df)
 
     if header_info is None:
-
         raise ValueError(
             "Could not find the transaction table."
         )
 
-    header_row = (
-        header_info["row_index"]
-    )
+    header_row = header_info["row_index"]
+    date_column_index = header_info["columns"]["date"]
 
+    # --------------------------------------------------------
     # Read the actual header values
-    # from the detected row.
+    # --------------------------------------------------------
+
     headers = []
 
-    for value in df.iloc[
-        header_row
-    ]:
+    for value in df.iloc[header_row]:
 
         if pd.isna(value):
             headers.append("")
+
         else:
             headers.append(
                 str(value).strip()
             )
 
-    # Extract everything below
-    # the transaction header.
+    # --------------------------------------------------------
+    # Extract everything below the transaction header
+    # --------------------------------------------------------
+
     transactions = df.iloc[
         header_row + 1:
     ].copy()
 
     transactions.columns = headers
 
-    # Remove completely empty rows.
+    # --------------------------------------------------------
+    # Remove completely empty rows
+    # --------------------------------------------------------
+
     transactions = transactions.dropna(
         how="all"
     )
 
-    # Remove completely empty columns.
+    # --------------------------------------------------------
+    # Remove completely empty columns
+    # --------------------------------------------------------
+
     transactions = transactions.dropna(
         axis=1,
         how="all"
@@ -311,8 +317,63 @@ def extract_transaction_table(
         drop=True
     )
 
-    return transactions
+    # --------------------------------------------------------
+    # Remove footer rows
+    #
+    # Bank statements commonly contain things like:
+    #
+    # Note | ...
+    # Total | ...
+    # Statement Summary | ...
+    #
+    # after the actual transactions.
+    #
+    # The transaction date column gives us a reliable way
+    # to distinguish transaction rows from these footers.
+    # --------------------------------------------------------
 
+    date_column = headers[date_column_index]
+
+    if date_column not in transactions.columns:
+        raise ValueError(
+            "Transaction date column could not be found."
+        )
+
+    parsed_dates = pd.to_datetime(
+        transactions[date_column],
+        errors="coerce",
+        dayfirst=True,
+    )
+
+    valid_date_rows = parsed_dates.notna()
+
+    # Find the first non-date row after transactions begin.
+    #
+    # Since transaction tables are contiguous, everything after
+    # the first invalid date is treated as footer content.
+    invalid_positions = (
+        valid_date_rows[~valid_date_rows].index
+    )
+
+    if len(invalid_positions) > 0:
+
+        first_invalid_position = (
+            invalid_positions[0]
+        )
+
+        transactions = transactions.iloc[
+            :first_invalid_position
+        ].copy()
+
+    # --------------------------------------------------------
+    # Final cleanup
+    # --------------------------------------------------------
+
+    transactions = transactions.reset_index(
+        drop=True
+    )
+
+    return transactions
 
 # ============================================================
 # Preview helper
