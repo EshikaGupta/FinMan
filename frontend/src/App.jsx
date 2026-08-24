@@ -674,11 +674,14 @@ function App() {
                   {result.transaction_count}{" "}
                   transactions
                 </small>
+                <button
+                  className="danger-link"
+                  onClick={resetUpload}
+                >
+                  Remove statement
+                </button>
               </div>
 
-              <span className="statement-icon">
-                ⌁
-              </span>
             </div>
           ) : (
             <div className="statement-pill muted-pill">
@@ -927,19 +930,6 @@ function App() {
               />
             )}
 
-            <div className="manage-row">
-              <span>
-                Statement:{" "}
-                {result.filename}
-              </span>
-
-              <button
-                className="danger-link"
-                onClick={resetUpload}
-              >
-                Remove statement
-              </button>
-            </div>
           </>
         )}
 
