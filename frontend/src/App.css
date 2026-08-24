@@ -478,7 +478,11 @@ nav {
 .ask-hero { width:min(760px,100%); text-align:center; }
 .ask-avatar { width:62px; height:62px; border-radius:20px; margin:0 auto 16px; display:grid; place-items:center; background:linear-gradient(145deg,#174d3c,#0d2922); border:1px solid #296e57; color:#42d7a1; font-size:27px; box-shadow:0 0 35px rgba(21,188,128,.08); }.ask-hero h2 { margin:5px 0 8px; color:#f0f1f1; font-size:28px; letter-spacing:-.7px; }.ask-hero > p { color:#6f777d; font-size:13px; }.suggestion-grid { display:grid; grid-template-columns:1fr 1fr; gap:9px; margin:28px 0 18px; }.suggestion-grid button { text-align:left; padding:13px; border:1px solid #23272b; background:#101214; color:#aeb4b8; border-radius:9px; font-size:13px; }.suggestion-grid button:hover { border-color:#2b745b; background:#111b17; }.suggestion-grid span { color:#38c995; margin-right:8px; }.chat-box { display:flex; gap:8px; padding:8px; background:#0d0f11; border:1px solid #292d31; border-radius:12px; }.chat-box textarea { flex:1; resize:none; background:transparent; color:#ddd; border:0; outline:none; padding:9px; font-size:13px; }.chat-box button,.primary-button { align-self:flex-end; background:#16a875; border:0; color:#fff; border-radius:8px; padding:10px 16px; font-size:12px; }.chat-box button:disabled,.primary-button:disabled { opacity:.45; cursor:not-allowed; }.ai-answer { margin-top:15px; padding:16px; text-align:left; border:1px solid #263d34; background:#0e1512; border-radius:10px; }.answer-label { display:flex; align-items:center; gap:7px; font-size:11px; color:#d8e5df; }.mini-avatar { width:22px; height:22px; display:grid; place-items:center; border-radius:7px; background:#174c3b; color:#4ad5a1; }.ai-answer p { margin:10px 0 0; color:#aeb7b2; font-size:13px; line-height:1.65; white-space:pre-wrap; }
 .welcome-grid { display:grid; grid-template-columns:1.45fr 1fr; gap:14px; }
-
+.chart-hover-line {
+  stroke: rgba(255, 255, 255, 0.18);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
 /* =========================================
    ENHANCED SUBSCRIPTIONS
 ========================================= */

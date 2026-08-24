@@ -1254,6 +1254,9 @@ function formatWeekLabel(start) {
 }
 
 function SmoothAreaChart({ data }) {
+  const [hoveredIndex, setHoveredIndex] = useState(null);
+  const [selectedIndex, setSelectedIndex] = useState(null);
+
   if (!data.length) {
     return (
       <div className="empty-chart">
@@ -1275,8 +1278,8 @@ function SmoothAreaChart({ data }) {
 
   const maxValue = Math.max(
     ...data.flatMap((item) => [
-      item.income,
-      item.expenses,
+      Number(item.income || 0),
+      Number(item.expenses || 0),
     ]),
     1
   );
@@ -1292,12 +1295,14 @@ function SmoothAreaChart({ data }) {
     const incomeY =
       top +
       chartHeight -
-      (item.income / maxValue) * chartHeight;
+      (Number(item.income || 0) / maxValue) *
+        chartHeight;
 
     const expenseY =
       top +
       chartHeight -
-      (item.expenses / maxValue) * chartHeight;
+      (Number(item.expenses || 0) / maxValue) *
+        chartHeight;
 
     return {
       ...item,
@@ -1308,16 +1313,16 @@ function SmoothAreaChart({ data }) {
   });
 
   const incomeLine = createSmoothPath(
-    points.map((p) => ({
-      x: p.x,
-      y: p.incomeY,
+    points.map((point) => ({
+      x: point.x,
+      y: point.incomeY,
     }))
   );
 
   const expenseLine = createSmoothPath(
-    points.map((p) => ({
-      x: p.x,
-      y: p.expenseY,
+    points.map((point) => ({
+      x: point.x,
+      y: point.expenseY,
     }))
   );
 
@@ -1332,6 +1337,53 @@ function SmoothAreaChart({ data }) {
     `${expenseLine} ` +
     `L ${points[points.length - 1].x} ${baseline} ` +
     `L ${points[0].x} ${baseline} Z`;
+
+  /*
+   * Hover takes priority.
+   * If nothing is being hovered, a clicked
+   * point remains selected.
+   */
+  const activeIndex =
+    hoveredIndex !== null
+      ? hoveredIndex
+      : selectedIndex;
+
+  const activePoint =
+    activeIndex !== null
+      ? points[activeIndex]
+      : null;
+
+  /*
+   * Tooltip position.
+   *
+   * Keep it inside the SVG so it doesn't
+   * disappear when hovering the first/last point.
+   */
+  let tooltipX = 0;
+  let tooltipY = 0;
+
+  if (activePoint) {
+    const tooltipWidth = 190;
+    const tooltipHeight = 90;
+
+    tooltipX = Math.max(
+      5,
+      Math.min(
+        activePoint.x - tooltipWidth / 2,
+        width - tooltipWidth - 5
+      )
+    );
+
+    const highestPoint = Math.min(
+      activePoint.incomeY,
+      activePoint.expenseY
+    );
+
+    tooltipY = Math.max(
+      5,
+      highestPoint - tooltipHeight - 12
+    );
+  }
 
   return (
     <div className="smooth-chart">
@@ -1353,8 +1405,9 @@ function SmoothAreaChart({ data }) {
           >
             <stop
               offset="0%"
-              stopOpacity="0.28"
+              stopOpacity="0.16"
             />
+
             <stop
               offset="100%"
               stopOpacity="0"
@@ -1370,8 +1423,9 @@ function SmoothAreaChart({ data }) {
           >
             <stop
               offset="0%"
-              stopOpacity="0.22"
+              stopOpacity="0.12"
             />
+
             <stop
               offset="100%"
               stopOpacity="0"
@@ -1386,7 +1440,7 @@ function SmoothAreaChart({ data }) {
             height="160%"
           >
             <feGaussianBlur
-              stdDeviation="4"
+              stdDeviation="3"
               result="blur"
             />
 
@@ -1416,7 +1470,10 @@ function SmoothAreaChart({ data }) {
 
         </defs>
 
-        {/* horizontal grid */}
+        {/* =========================
+            GRID
+        ========================== */}
+
         {[0, 1, 2, 3, 4].map((i) => {
           const y =
             top +
@@ -1434,51 +1491,82 @@ function SmoothAreaChart({ data }) {
           );
         })}
 
-        {/* income area */}
+        {/* =========================
+            ACTIVE PERIOD GUIDE
+        ========================== */}
+
+        {activePoint && (
+          <line
+            x1={activePoint.x}
+            x2={activePoint.x}
+            y1={top}
+            y2={baseline}
+            className="chart-hover-line"
+            pointerEvents="none"
+          />
+        )}
+
+        {/* =========================
+            AREAS
+        ========================== */}
+
         <path
           d={incomeArea}
           className="income-area"
         />
 
-        {/* expense area */}
         <path
           d={expenseArea}
           className="expense-area"
         />
 
-        {/* income smooth line */}
+        {/* =========================
+            LINES
+        ========================== */}
+
         <path
           d={incomeLine}
           className="income-line"
           filter="url(#incomeGlow)"
         />
 
-        {/* expense smooth line */}
         <path
           d={expenseLine}
           className="expense-line"
           filter="url(#expenseGlow)"
         />
 
-        {/* points */}
+        {/* =========================
+            POINTS
+        ========================== */}
+
         {points.map((point, index) => (
-          <g key={index}>
+          <g key={point.key || index}>
 
             <circle
               cx={point.x}
               cy={point.incomeY}
-              r="3"
+              r={
+                activeIndex === index
+                  ? 5
+                  : 3
+              }
               className="income-point"
             />
 
             <circle
               cx={point.x}
               cy={point.expenseY}
-              r="3"
+              r={
+                activeIndex === index
+                  ? 5
+                  : 3
+              }
               className="expense-point"
             />
 
             {/* X-axis label */}
+
             <text
               x={point.x}
               y={height - 18}
@@ -1490,6 +1578,141 @@ function SmoothAreaChart({ data }) {
 
           </g>
         ))}
+
+        {/* =========================
+            INVISIBLE INTERACTION AREAS
+        ========================== */}
+
+        {points.map((point, index) => {
+
+          const previousX =
+            index === 0
+              ? left
+              : (points[index - 1].x +
+                  point.x) /
+                2;
+
+          const nextX =
+            index === points.length - 1
+              ? width - right
+              : (point.x +
+                  points[index + 1].x) /
+                2;
+
+          return (
+            <rect
+              key={`hit-${point.key || index}`}
+              x={previousX}
+              y={top}
+              width={nextX - previousX}
+              height={chartHeight}
+              fill="transparent"
+              style={{
+                cursor: "pointer",
+              }}
+              onMouseEnter={() =>
+                setHoveredIndex(index)
+              }
+              onMouseLeave={() =>
+                setHoveredIndex(null)
+              }
+              onClick={() => {
+                setSelectedIndex((current) =>
+                  current === index
+                    ? null
+                    : index
+                );
+              }}
+            />
+          );
+        })}
+
+        {/* =========================
+            TOOLTIP
+        ========================== */}
+
+        {activePoint && (
+          <foreignObject
+            x={tooltipX}
+            y={tooltipY}
+            width="190"
+            height="90"
+            pointerEvents="none"
+          >
+            <div
+              style={{
+                width: "190px",
+                boxSizing: "border-box",
+                padding: "10px 12px",
+                borderRadius: "8px",
+                background: "#101416",
+                border: "1px solid rgba(255,255,255,0.14)",
+                boxShadow:
+                  "0 8px 24px rgba(0,0,0,0.35)",
+                color: "#ffffff",
+                fontFamily:
+                  "inherit",
+                fontSize: "12px",
+                lineHeight: "1.5",
+              }}
+            >
+
+              <div
+                style={{
+                  fontWeight: 600,
+                  marginBottom: "6px",
+                  color: "#dfe7e5",
+                }}
+              >
+                {activePoint.label}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent:
+                    "space-between",
+                  gap: "12px",
+                  marginBottom: "2px",
+                }}
+              >
+                <span>
+                  Income
+                </span>
+
+                <strong>
+                  {money(
+                    Number(
+                      activePoint.income || 0
+                    )
+                  )}
+                </strong>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent:
+                    "space-between",
+                  gap: "12px",
+                }}
+              >
+                <span>
+                  Expenses
+                </span>
+
+                <strong>
+                  {money(
+                    Number(
+                      activePoint.expenses || 0
+                    )
+                  )}
+                </strong>
+              </div>
+
+            </div>
+          </foreignObject>
+        )}
 
       </svg>
 
@@ -1565,14 +1788,18 @@ function buildTrendData(transactions, mode) {
       groups.set(key, {
         income: 0,
         expenses: 0,
-        date,
       });
     }
 
     const group = groups.get(key);
 
-    group.income += Number(transaction.credit || 0);
-    group.expenses += Number(transaction.debit || 0);
+    group.income += Math.abs(
+      Number(transaction.credit || 0)
+    );
+
+    group.expenses += Math.abs(
+      Number(transaction.debit || 0)
+    );
   }
 
   const sorted = [...groups.entries()].sort(
@@ -1607,6 +1834,7 @@ function buildTrendData(transactions, mode) {
     }
 
     return {
+      key,
       label,
       income: value.income,
       expenses: value.expenses,
