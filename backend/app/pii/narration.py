@@ -1,14 +1,11 @@
 import re
 
-from .redactor import Redactor
-
 
 # ------------------------------------------------------------
 # Transaction / bank reference identifiers
 # ------------------------------------------------------------
 
 REFERENCE_PATTERNS = [
-
     re.compile(
         r"(?i)"
         r"\b(?:ref|reference|ref\.?\s*no|"
@@ -16,167 +13,108 @@ REFERENCE_PATTERNS = [
         r"txn\s*(?:id|no|number)?|"
         r"rrn|utr)\b"
         r"\s*[:#.\-]?\s*"
-        r"[A-Za-z0-9\-\/]{6,}"
+        r"(?P<value>[A-Za-z0-9][A-Za-z0-9\-/]{5,})"
     ),
-
 ]
 
-
-# ------------------------------------------------------------
-# Generic bank/internal reference
-#
-# Example:
-# ICICI001183
-# HDFC001234
-#
-# We only consider a bank-style prefix followed by
-# a sufficiently long numeric identifier.
-# ------------------------------------------------------------
-
+# Common bank-generated references such as HDFC001234.
 BANK_REFERENCE_PATTERN = re.compile(
-    r"\b"
-    r"[A-Z]{4}"
-    r"\d{6,}"
-    r"\b"
+    r"\b[A-Z]{4}\d{6,}\b"
 )
 
+_REFERENCE_PLACEHOLDER = "__FINMAN_TRANSACTION_REFERENCE_{index}__"
 
-def redact_references(
-    text,
-    redactor,
-):
-    """
-    Redact explicit transaction references and
-    bank-internal reference identifiers.
 
-    Merchant names and counterparty names are left
-    untouched.
-    """
-
+def _reference_matches(text):
     matches = []
 
     for pattern in REFERENCE_PATTERNS:
-
         for match in pattern.finditer(text):
+            value = match.groupdict().get("value") or match.group()
+            value_start = match.start("value") if "value" in match.groupdict() else match.start()
+            value_end = match.end("value") if "value" in match.groupdict() else match.end()
+            matches.append((value_start, value_end, value))
 
-            matches.append(
-                (
-                    match.start(),
-                    match.end(),
-                    match.group(),
-                )
-            )
+    for match in BANK_REFERENCE_PATTERN.finditer(text):
+        matches.append((match.start(), match.end(), match.group()))
 
-    for match in BANK_REFERENCE_PATTERN.finditer(
-        text
-    ):
-
-        matches.append(
-            (
-                match.start(),
-                match.end(),
-                match.group(),
-            )
-        )
-
-    if not matches:
-        return text
-
-    # Remove overlapping matches.
-    matches.sort(
-        key=lambda item: (
-            item[0],
-            -(item[1] - item[0]),
-        )
-    )
-
+    # Keep the longest match when spans overlap.
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
     filtered = []
-
-    for match in matches:
-
-        if not filtered:
-            filtered.append(match)
+    for item in matches:
+        if filtered and item[0] < filtered[-1][1]:
             continue
+        filtered.append(item)
+    return filtered
 
-        previous = filtered[-1]
 
-        if match[0] >= previous[1]:
-            filtered.append(match)
+def extract_transaction_reference(text):
+    """Extract the bank/provider transaction reference from a narration.
+
+    References are intentionally kept in the stored narration because they
+    are useful for deterministic transaction deduplication. Returns None when
+    the narration does not contain a recognizable reference.
+    """
+    if text is None:
+        return None
+
+    text = str(text)
+    matches = _reference_matches(text)
+    if not matches:
+        return None
+
+    # Prefer an explicit labelled reference over a generic bank-style token.
+    for pattern in REFERENCE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group("value")
+
+    return matches[0][2]
+
+
+def _protect_references(text):
+    """Temporarily protect references from generic PII redaction."""
+    matches = _reference_matches(text)
+    if not matches:
+        return text, {}
 
     output = []
+    replacements = {}
+    last = 0
 
-    last_position = 0
+    for index, (start, end, value) in enumerate(matches):
+        output.append(text[last:start])
+        placeholder = _REFERENCE_PLACEHOLDER.format(index=index)
+        output.append(placeholder)
+        replacements[placeholder] = value
+        last = end
 
-    for start, end, value in filtered:
-
-        output.append(
-            text[last_position:start]
-        )
-
-        replacement = redactor.replacement_for(
-            "transaction_reference",
-            value,
-        )
-
-        output.append(
-            replacement
-        )
-
-        last_position = end
-
-    output.append(
-        text[last_position:]
-    )
-
-    return "".join(output)
+    output.append(text[last:])
+    return "".join(output), replacements
 
 
-def sanitize_narration(
-    text,
-):
+def sanitize_narration(text):
+    """Sanitize narration while preserving transaction references.
+
+    Merchant/payee names and bank transaction references are preserved. Other
+    high-confidence PII (UPI IDs, account/card numbers, phone, email, etc.) is
+    still redacted by the normal PII detector.
     """
-    Sanitize financial transaction narration.
-
-    Important:
-    - merchant names are preserved
-    - counterparty names are preserved
-    - transaction modes are preserved
-    - UPI IDs are redacted
-    - email/phone/IFSC/account/card identifiers
-      are redacted
-    - transaction references are redacted
-    """
-
     if text is None:
         return text
 
     text = str(text)
-
     if not text.strip():
         return text
 
-    redactor = Redactor()
+    # Import locally to avoid a module cycle and protect transaction
+    # references before the generic PII detector sees them.
+    from .redactor import Redactor
 
-    # First remove explicit transaction/bank references.
-    text = redact_references(
-        text,
-        redactor,
-    )
+    protected_text, replacements = _protect_references(text)
+    result = Redactor().redact(protected_text).text
 
-    # Then use the existing high-confidence PII
-    # detector for:
-    #
-    # UPI ID
-    # email
-    # phone
-    # PAN
-    # Aadhaar
-    # IFSC
-    # account number
-    # card number
-    #
-    result = redactor.redact(
-        text
-    )
+    for placeholder, original in replacements.items():
+        result = result.replace(placeholder, original)
 
-    return result.text
+    return result

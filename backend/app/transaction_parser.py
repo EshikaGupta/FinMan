@@ -4,6 +4,8 @@ from .schemas import (
     ColumnMapping,
     Transaction,
 )
+from .pii.narration import extract_transaction_reference
+from numbers import Integral
 
 
 def get_value(
@@ -67,14 +69,16 @@ def normalize_transactions(
         if pd.isna(description_value):
             description_value = ""
 
+        description = str(
+            description_value
+        ).strip()
+
         transaction = Transaction(
             date=str(
                 date_value
             ).strip(),
 
-            description=str(
-                description_value
-            ).strip(),
+            description=description,
 
             debit=to_float(
                 get_value(
@@ -96,6 +100,8 @@ def normalize_transactions(
                     mapping.balance,
                 )
             ),
+            external_transaction_id=extract_transaction_reference(description),
+            source_row_number=(int(index) + 1 if isinstance(index, Integral) else None),
         )
 
         transactions.append(

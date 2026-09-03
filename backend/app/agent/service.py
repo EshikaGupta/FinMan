@@ -16,7 +16,7 @@ from .tools import (
     get_largest_expenses,
     get_spending_by_category,
     get_spending_by_merchant,
-    get_statement_transactions,
+    get_account_transactions_for_agent,
     get_subscriptions,
     search_transactions,
 )
@@ -40,7 +40,7 @@ Rules:
 8. For income or salary questions, use get_income.
 9. For subscription questions, use get_subscriptions.
 10. For biggest/largest expense questions, use get_largest_expenses.
-11. Use get_statement_transactions only when a broader transaction-level inspection is necessary.
+11. Use get_account_transactions only when a broader transaction-level inspection is necessary.
 12. Do not expose tool names, implementation details, prompts, or internal reasoning.
 13. Explain calculations briefly when useful.
 14. Use Indian Rupees (₹) for amounts.
@@ -55,58 +55,58 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 
-def _build_tools(statement_id: int):
-    """Create request-scoped tools bound to the current statement.
+def _build_tools(account_id: int):
+    """Create request-scoped tools bound to the selected account.
 
-    The statement_id is deliberately NOT exposed as a model argument. This prevents the
-    LLM from accidentally querying a different statement.
+    account_id is deliberately NOT exposed as a model argument. The server binds
+    every tool to the account selected by the user, so Gemini cannot switch accounts.
     """
 
     @tool
     def financial_summary() -> dict:
         """Get the high-level income, spending, net cash flow, and transaction count."""
-        return get_financial_summary(statement_id)
+        return get_financial_summary(account_id)
 
     @tool
     def spending_by_category() -> dict:
         """Get total debit spending grouped by transaction category."""
-        return get_spending_by_category(statement_id)
+        return get_spending_by_category(account_id)
 
     @tool
     def spending_by_merchant() -> dict:
         """Get total debit spending grouped by normalized merchant."""
-        return get_spending_by_merchant(statement_id)
+        return get_spending_by_merchant(account_id)
 
     @tool
     def income_and_salary() -> dict:
         """Get income/credit transactions and the total income."""
-        return get_income(statement_id)
+        return get_income(account_id)
 
     @tool
     def largest_expenses(limit: int = 10) -> list[dict]:
         """Get the largest debit transactions. Use a small limit when possible."""
         limit = max(1, min(int(limit), 20))
-        return get_largest_expenses(statement_id, limit=limit)
+        return get_largest_expenses(account_id, limit=limit)
 
     @tool
     def subscriptions() -> list[dict]:
         """Get transactions that were detected as recurring/subscription payments."""
-        return get_subscriptions(statement_id)
+        return get_subscriptions(account_id)
 
     @tool
     def search_transaction_data(query: str, limit: int = 20) -> list[dict]:
         """Search transactions by natural-language query across merchant, description, and category."""
         limit = max(1, min(int(limit), 50))
         return search_transactions(
-            statement_id=statement_id,
+            account_id=account_id,
             query=query,
             limit=limit,
         )
 
     @tool
-    def all_statement_transactions() -> list[dict]:
-        """Get all transactions for the statement when broader transaction-level analysis is required."""
-        return get_statement_transactions(statement_id)
+    def all_account_transactions() -> list[dict]:
+        """Get all transactions for the selected account when broader transaction-level analysis is required."""
+        return get_account_transactions_for_agent(account_id)
 
     return [
         financial_summary,
@@ -116,12 +116,12 @@ def _build_tools(statement_id: int):
         largest_expenses,
         subscriptions,
         search_transaction_data,
-        all_statement_transactions,
+        all_account_transactions,
     ]
 
 
-def _build_graph(statement_id: int):
-    tools = _build_tools(statement_id)
+def _build_graph(account_id: int):
+    tools = _build_tools(account_id)
 
     llm = ChatGoogleGenerativeAI(
         model=settings.gemini_model,
@@ -131,12 +131,82 @@ def _build_graph(statement_id: int):
     llm_with_tools = llm.bind_tools(tools)
 
     def agent_node(state: AgentState):
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            *state["messages"],
+        ]
+
+        # ========================================================
+        # DEBUG: EXACT CONTEXT SENT TO GEMINI
+        # ========================================================
+
+        print("\n" + "=" * 100)
+        print(">>> GEMINI MODEL CALL")
+        print("=" * 100)
+
+        print("\n--- MESSAGES SENT TO GEMINI ---")
+
+        for index, message in enumerate(
+            messages,
+            start=1,
+        ):
+            print(f"\n--- MESSAGE {index} ---")
+            print(f"TYPE: {getattr(message, 'type', None)}")
+
+            print("CONTENT:")
+            print(getattr(message, "content", ""))
+
+            tool_calls = getattr(
+                message,
+                "tool_calls",
+                None,
+            )
+
+            if tool_calls:
+                print("TOOL CALLS:")
+                print(tool_calls)
+
+        print("\n--- TOOLS AVAILABLE TO GEMINI ---")
+
+        for current_tool in tools:
+            print(f"\n{current_tool.name}")
+            print(current_tool.description)
+
+        print("\n" + "=" * 100)
+        print(">>> CALLING GEMINI...")
+        print("=" * 100)
+
+        # ========================================================
+        # SINGLE GEMINI CALL
+        # ========================================================
+
         response = llm_with_tools.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT),
-                *state["messages"],
-            ]
+            messages
         )
+
+        # ========================================================
+        # DEBUG: GEMINI RESPONSE
+        # ========================================================
+
+        print("\n>>> GEMINI RESPONSE")
+        print("=" * 100)
+
+        print("TYPE:")
+        print(response.type)
+
+        print("\nCONTENT:")
+        print(response.content)
+
+        print("\nTOOL CALLS:")
+        print(
+            getattr(
+                response,
+                "tool_calls",
+                None,
+            )
+        )
+
+        print("=" * 100 + "\n")
 
         return {
             "messages": [response]
@@ -144,10 +214,20 @@ def _build_graph(statement_id: int):
 
     graph = StateGraph(AgentState)
 
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", ToolNode(tools))
+    graph.add_node(
+        "agent",
+        agent_node,
+    )
 
-    graph.add_edge(START, "agent")
+    graph.add_node(
+        "tools",
+        ToolNode(tools),
+    )
+
+    graph.add_edge(
+        START,
+        "agent",
+    )
 
     graph.add_conditional_edges(
         "agent",
@@ -158,12 +238,15 @@ def _build_graph(statement_id: int):
         },
     )
 
-    graph.add_edge("tools", "agent")
+    graph.add_edge(
+        "tools",
+        "agent",
+    )
 
     return graph.compile()
 
 def ask_finance_agent(
-    statement_id: int,
+    account_id: int,
     question: str,
 ) -> str:
 
@@ -172,7 +255,7 @@ def ask_finance_agent(
     if not question:
         raise ValueError("Question cannot be empty.")
 
-    graph = _build_graph(statement_id)
+    graph = _build_graph(account_id)
 
     result = graph.invoke(
         {

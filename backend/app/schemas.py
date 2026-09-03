@@ -18,6 +18,10 @@ class Transaction(BaseModel):
     credit: Optional[float] = None
     balance: Optional[float] = None
 
+    # Source / identity fields used for transaction deduplication.
+    external_transaction_id: Optional[str] = None
+    source_row_number: Optional[int] = None
+
     # Transaction intelligence
     category: Optional[str] = None
     merchant: Optional[str] = None

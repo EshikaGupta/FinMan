@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { SignIn, useAuth, useClerk, useUser } from "@clerk/react";
 import "./App.css";
 
 const API_URL = "http://127.0.0.1:8000";
@@ -171,6 +172,17 @@ function App() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [duplicateStatement, setDuplicateStatement] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const { isLoaded: clerkLoaded, isSignedIn, getToken } = useAuth();
+  const { signOut } = useClerk();
+  const { user } = useUser();
+  const [authError, setAuthError] = useState("");
+
+  const [accounts, setAccounts] = useState([]);
+  const [selectedAccountId, setSelectedAccountId] = useState(null);
+  const [accountsLoading, setAccountsLoading] = useState(true);
 
   const [activeTab, setActiveTab] = useState("dashboard");
 
@@ -202,6 +214,169 @@ function App() {
       return next;
     });
   };
+
+  const apiFetch = async (path, options = {}) => {
+    const token = await getToken();
+    const headers = new Headers(options.headers || {});
+
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+
+    return fetch(`${API_URL}${path}`, {
+      ...options,
+      headers,
+    });
+  };
+
+  useEffect(() => {
+    if (!clerkLoaded) return;
+
+    if (!isSignedIn) {
+      setAccounts([]);
+      setSelectedAccountId(null);
+      setResult(null);
+      setAuthError("");
+      return;
+    }
+
+    async function syncAuthenticatedUser() {
+      try {
+        setAuthError("");
+        const response = await apiFetch("/auth/me");
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "Could not initialize your FinMan account.");
+        }
+
+        await loadAccounts();
+      } catch (err) {
+        setAuthError(err.message || "Could not initialize your FinMan account.");
+      }
+    }
+
+    syncAuthenticatedUser();
+  }, [clerkLoaded, isSignedIn]);
+
+  async function handleLogout() {
+    setAccounts([]);
+    setSelectedAccountId(null);
+    setResult(null);
+    setAnswer("");
+    setActiveTab("dashboard");
+    await signOut();
+  }
+
+  async function loadAccounts(preferredAccountId = null) {
+    try {
+      setAccountsLoading(true);
+      const response = await apiFetch("/accounts");
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not load accounts.");
+      }
+
+      const availableAccounts = data.accounts || [];
+      setAccounts(availableAccounts);
+
+      const nextId =
+        preferredAccountId ??
+        selectedAccountId ??
+        availableAccounts[0]?.id ??
+        null;
+
+      if (nextId) {
+        setSelectedAccountId(Number(nextId));
+      }
+
+      return availableAccounts;
+    } catch (err) {
+      setError(err.message || "Could not load accounts.");
+      return [];
+    } finally {
+      setAccountsLoading(false);
+    }
+  }
+
+  async function loadFinancialInsights(accountId) {
+    if (!accountId) return;
+
+    try {
+      const response = await apiFetch(`/accounts/${accountId}/insights`);
+      const data = await response.json();
+
+      if (!response.ok) {
+        return;
+      }
+
+      // Insights are secondary enrichment. Never clear or block dashboard data.
+      setResult((current) =>
+        current && Number(current.account_id) === Number(accountId)
+          ? { ...current, insights: data.insights }
+          : current
+      );
+    } catch {
+      // The dashboard is still fully usable if AI insight generation fails.
+    }
+  }
+
+  async function loadAccount(accountId) {
+    if (!accountId) return;
+
+    setLoading(true);
+    setError("");
+    setAnswer("");
+
+    try {
+      const response = await apiFetch(`/accounts/${accountId}/analysis`);
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Could not load the account.");
+      }
+
+      const latestStatement = data.statements?.[0];
+
+      setSelectedAccountId(Number(accountId));
+      setResult({
+        account_id: data.account.id,
+        statement_id: latestStatement?.id || null,
+        filename: latestStatement?.filename || "Account overview",
+        transaction_count: data.transactions?.length || 0,
+        uploaded_transaction_count: 0,
+        account: data.account,
+        account_details: data.account,
+        statements: data.statements || [],
+        transactions: data.transactions || [],
+        analysis: data.analysis,
+        insights: null,
+      });
+      setActiveTab("dashboard");
+      setSearch("");
+      setTransactionFilter("all");
+      setCategoryFilter("all");
+      setDateFilter("all");
+      setSortBy("date-desc");
+      setTransactionPage(1);
+    } catch (err) {
+      setError(err.message || "Could not load the account.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleAccountChange = async (event) => {
+    const accountId = Number(event.target.value);
+    setSelectedAccountId(accountId);
+    await loadAccount(accountId);
+  };
+
+  const selectedAccount = accounts.find(
+    (account) => Number(account.id) === Number(selectedAccountId)
+  );
+
   const TRANSACTIONS_PER_PAGE = 25;
 
   const analysis = result?.analysis;
@@ -469,13 +644,14 @@ function App() {
     setError("");
     setResult(null);
     setAnswer("");
+    setDuplicateStatement(null);
 
     const formData = new FormData();
     formData.append("file", file);
 
     try {
-      const response = await fetch(
-        `${API_URL}/statements/upload`,
+      const response = await apiFetch(
+        "/statements/upload",
         {
           method: "POST",
           body: formData,
@@ -484,14 +660,39 @@ function App() {
 
       const data = await response.json();
 
+      // 409 is an intentional business outcome, not an upload failure:
+      // either the exact file (Level 1) or the same financial statement
+      // (Level 2) has already been imported.
+      if (
+        response.status === 409 &&
+        ["STATEMENT_ALREADY_EXISTS", "STATEMENT_ALREADY_IMPORTED"].includes(
+          data.detail?.code
+        )
+      ) {
+        setDuplicateStatement(data.detail);
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(
-          data.detail || "Upload failed."
+          typeof data.detail === "string"
+            ? data.detail
+            : "Upload failed."
         );
       }
 
       setResult(data);
+      setSelectedAccountId(Number(data.account_id));
       setActiveTab("dashboard");
+
+      // The dashboard is ready now. Do not keep the upload spinner active while
+      // secondary AI enrichment runs.
+      setLoading(false);
+
+      // These are deliberately non-blocking. Account refresh and Gemini
+      // insights happen only after the dashboard data has been rendered.
+      void loadAccounts(Number(data.account_id));
+      void loadFinancialInsights(Number(data.account_id));
 
       // Reset transaction controls for new statement
       setSearch("");
@@ -513,7 +714,7 @@ function App() {
   const handleAsk = async () => {
     if (
       !question.trim() ||
-      !result?.statement_id
+      !selectedAccountId
     ) {
       return;
     }
@@ -523,16 +724,15 @@ function App() {
     setError("");
 
     try {
-      const response = await fetch(
-        `${API_URL}/chat`,
+      const response = await apiFetch(
+        "/chat",
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            statement_id:
-              result.statement_id,
+            account_id: selectedAccountId,
             message: question,
           }),
         }
@@ -560,6 +760,10 @@ function App() {
 
   const resetUpload = () => {
     setFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    setDuplicateStatement(null);
     setResult(null);
     setAnswer("");
     setQuestion("");
@@ -572,6 +776,43 @@ function App() {
     setSortBy("date-desc");
     setTransactionPage(1);
   };
+
+  if (!clerkLoaded) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <div className="brand-mark">F</div>
+          <p className="eyebrow">FINMAN</p>
+          <h1>Loading your account…</h1>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isSignedIn) {
+    return (
+      <div className="auth-shell">
+        <div className=" auth-card clerk-auth-card">
+          <div className="brand-mark auth-brand-mark">F</div>
+          <p className="eyebrow">PERSONAL FINANCE</p>
+          <h1 className="auth-card-h1">Your finances, in one place.</h1>
+
+          <div className="clerk-sign-in">
+            <SignIn />
+          </div>
+
+          {authError && (
+            <div className="error-banner auth-error">{authError}</div>
+          )}
+
+          <p className="auth-footnote">
+            Sign-in methods such as Google, Apple, email, passkeys, and others
+            are configured securely from your Clerk dashboard.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -724,20 +965,56 @@ function App() {
 
           <div className="top-actions">
 
-            {result && (
-              <span className="statement-name">
-                {result.filename}
-              </span>
+            {accounts.length > 0 && (
+              <div className="account-selector">
+                <span className="account-selector-label">ACCOUNT</span>
+                <select
+                  value={selectedAccountId || ""}
+                  onChange={handleAccountChange}
+                  disabled={accountsLoading || loading}
+                  aria-label="Select account"
+                >
+                  {accounts.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {(account.bank_name || "Account")} · {
+                        account.account_number
+                          ? `••••${String(account.account_number).slice(-4)}`
+                          : `#${account.id}`
+                      }
+                    </option>
+                  ))}
+                </select>
+              </div>
             )}
 
-            <button
-              className="ghost-button"
-              onClick={() =>
-                setActiveTab("dashboard")
-              }
-            >
-              Overview
-            </button>
+            
+
+            <div className="user-menu">
+              {user?.imageUrl ? (
+                <img
+                  className="user-avatar"
+                  src={user.imageUrl}
+                  alt=""
+                />
+              ) : (
+                <div className="user-avatar user-avatar-fallback">
+                  {((user?.fullName || user?.firstName || "U").charAt(0)).toUpperCase()}
+                </div>
+              )}
+
+              <div className="user-copy">
+                <strong>{user?.fullName || user?.firstName || "User"}</strong>
+                <small>{user?.primaryEmailAddress?.emailAddress}</small>
+              </div>
+
+              <button
+                type="button"
+                className="logout-button"
+                onClick={handleLogout}
+              >
+                Sign out
+              </button>
+            </div>
 
           </div>
         </header>
@@ -780,6 +1057,7 @@ function App() {
                   </span>
 
                   <input
+                    ref={fileInputRef}
                     type="file"
                     accept=".xlsx,.csv"
                     onChange={(event) => {
@@ -934,6 +1212,87 @@ function App() {
         )}
 
       </main>
+
+      {duplicateStatement && (
+        <div
+          className="duplicate-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setDuplicateStatement(null);
+            }
+          }}
+        >
+          <section
+            className="duplicate-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="duplicate-statement-title"
+          >
+            <div className="duplicate-modal-icon">↻</div>
+
+            <p className="eyebrow">
+              {duplicateStatement.reason === "LEVEL_1_FILE_IDENTITY"
+                ? "FILE ALREADY IMPORTED"
+                : "STATEMENT ALREADY IMPORTED"}
+            </p>
+
+            <h2 id="duplicate-statement-title">
+              {duplicateStatement.reason === "LEVEL_1_FILE_IDENTITY"
+                ? "You've already uploaded this exact file."
+                : "This financial statement is already in FinMan."}
+            </h2>
+
+            <p className="duplicate-modal-copy">
+              {duplicateStatement.reason === "LEVEL_1_FILE_IDENTITY" ? (
+                <>
+                  <strong>{duplicateStatement.filename}</strong> is already saved
+                  for this account. No new transactions were added.
+                </>
+              ) : (
+                <>
+                  This file has different file metadata or a different filename,
+                  but its financial contents match <strong>{duplicateStatement.filename}</strong>.
+                  FinMan did not import the transactions again, so your analysis
+                  will not double-count them.
+                </>
+              )}
+            </p>
+
+            <div className="duplicate-modal-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  setDuplicateStatement(null);
+                  setFile(null);
+                  if (fileInputRef.current) {
+                    fileInputRef.current.value = "";
+                  }
+                }}
+              >
+                Upload a different statement
+              </button>
+
+              <button
+                type="button"
+                className="primary-button"
+                onClick={async () => {
+                  const accountId = Number(duplicateStatement.account_id);
+                  setDuplicateStatement(null);
+                  setFile(null);
+                  if (fileInputRef.current) {
+                    fileInputRef.current.value = "";
+                  }
+                  await loadAccount(accountId);
+                }}
+              >
+                View old analysis
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
@@ -1842,6 +2201,101 @@ function buildTrendData(transactions, mode) {
   });
 }
 
+function AccountDetails({ details }) {
+  const [showAccountNumber, setShowAccountNumber] = useState(false);
+  const [isOpen, setIsOpen] = useState(true);
+
+  const accountNumber = String(details?.account_number || "").trim();
+  const maskedAccountNumber = accountNumber
+    ? accountNumber.length > 4
+      ? `${"•".repeat(Math.min(accountNumber.length - 4, 8))}${accountNumber.slice(-4)}`
+      : accountNumber
+    : "";
+
+  const displayValue = (value) =>
+    value && String(value).trim() ? String(value).trim() : "Not available";
+
+  const hasDetails = Object.values(details || {}).some(
+    (value) => String(value || "").trim()
+  );
+
+  if (!hasDetails) return null;
+
+  return (
+    <section className="account-details-panel">
+      <button
+        type="button"
+        className={`account-details-heading ${isOpen ? "open" : "collapsed"}`}
+        onClick={() => setIsOpen((current) => !current)}
+        aria-expanded={isOpen}
+      >
+        <div className="account-details-heading-content">
+          <p className="eyebrow">STATEMENT ACCOUNT</p>
+          <h2>Account details</h2>
+          {isOpen && (
+            <p className="account-details-subtitle">
+              Check that this statement belongs to the account you expect.
+            </p>
+          )}
+        </div>
+
+        <div className="account-details-heading-right">
+          <span className="account-details-lock">LOCAL ONLY</span>
+          <span className={`account-details-chevron ${isOpen ? "open" : ""}`}>
+            ↓
+          </span>
+        </div>
+      </button>
+
+      <div className={`account-details-collapse ${isOpen ? "open" : "collapsed"}`}>
+        <div className="account-details-grid">
+          <div className="account-detail-item">
+            <span>ACCOUNT HOLDER</span>
+            <strong>{displayValue(details.account_holder)}</strong>
+          </div>
+
+          <div className="account-detail-item">
+            <span>ACCOUNT NUMBER</span>
+            <div className="account-number-value">
+              <strong>
+                {accountNumber
+                  ? showAccountNumber
+                    ? accountNumber
+                    : maskedAccountNumber
+                  : "Not available"}
+              </strong>
+
+              {accountNumber && (
+                <button
+                  type="button"
+                  className="account-number-toggle"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setShowAccountNumber((current) => !current);
+                  }}
+                >
+                  {showAccountNumber ? "Hide" : "Show"}
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="account-detail-item">
+            <span>ACCOUNT TYPE</span>
+            <strong>{displayValue(details.account_type)}</strong>
+          </div>
+
+          <div className="account-detail-item">
+            <span>BANK</span>
+            <strong>{displayValue(details.bank_name)}</strong>
+          </div>
+
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function Dashboard({
   analysis,
   result,
@@ -1855,80 +2309,532 @@ function Dashboard({
   const salary = Number(analysis?.salary_income || 0);
   const income = Number(analysis?.total_income || 0);
   const spending = Number(analysis?.total_spending || 0);
-  const investment = Number(categories.Investments || 0);
+  const netCashFlow = Number(
+    analysis?.net_cash_flow ?? income - spending
+  );
 
-  const categoryEntries = Object.entries(categories).slice(0, 6);
+  const investment = Number(
+    categories?.Investments || 0
+  );
+
+  const categoryEntries = Object.entries(
+    categories || {}
+  )
+    .sort(([, a], [, b]) => Number(b) - Number(a))
+    .slice(0, 6);
+
+  /*
+   * ---------------------------------------------------------
+   * PERIOD INSIGHTS
+   * ---------------------------------------------------------
+   */
+
+  const insightData = useMemo(() => {
+    const monthly = new Map();
+
+    for (const transaction of transactions || []) {
+      const date = parseTransactionDate(
+        transaction.date
+      );
+
+      if (!date) continue;
+
+      const key =
+        `${date.getFullYear()}-` +
+        `${String(date.getMonth() + 1).padStart(2, "0")}`;
+
+      if (!monthly.has(key)) {
+        monthly.set(key, {
+          income: 0,
+          expenses: 0,
+          transactions: 0,
+        });
+      }
+
+      const group = monthly.get(key);
+
+      group.income += Math.abs(
+        Number(transaction.credit || 0)
+      );
+
+      group.expenses += Math.abs(
+        Number(transaction.debit || 0)
+      );
+
+      group.transactions += 1;
+    }
+
+    const periods = [...monthly.entries()]
+      .sort(([a], [b]) =>
+        a.localeCompare(b)
+      );
+
+    const latest =
+      periods.length
+        ? periods[periods.length - 1][1]
+        : {
+            income: 0,
+            expenses: 0,
+            transactions: 0,
+          };
+
+    const previous =
+      periods.length > 1
+        ? periods[periods.length - 2][1]
+        : null;
+
+    const monthCount = periods.length;
+
+    const averageMonthlyIncome =
+      monthCount > 0
+        ? periods.reduce(
+            (sum, [, value]) =>
+              sum + value.income,
+            0
+          ) / monthCount
+        : 0;
+
+    const averageMonthlySpending =
+      monthCount > 0
+        ? periods.reduce(
+            (sum, [, value]) =>
+              sum + value.expenses,
+            0
+          ) / monthCount
+        : 0;
+
+    let spendingChange = null;
+
+    if (
+      previous &&
+      previous.expenses > 0
+    ) {
+      spendingChange =
+        (
+          (latest.expenses -
+            previous.expenses) /
+          previous.expenses
+        ) * 100;
+    }
+
+    let incomeChange = null;
+
+    if (
+      previous &&
+      previous.income > 0
+    ) {
+      incomeChange =
+        (
+          (latest.income -
+            previous.income) /
+          previous.income
+        ) * 100;
+    }
+
+    const savingsRate =
+      income > 0
+        ? (netCashFlow / income) * 100
+        : 0;
+
+    return {
+      averageMonthlyIncome,
+      averageMonthlySpending,
+      savingsRate,
+      spendingChange,
+      incomeChange,
+      latest,
+      previous,
+      monthCount,
+    };
+  }, [transactions, income, netCashFlow]);
+
+  /*
+   * ---------------------------------------------------------
+   * TOP CATEGORY
+   * ---------------------------------------------------------
+   */
+
+  const topCategory = useMemo(() => {
+    const entries = Object.entries(
+      categories || {}
+    )
+      .map(([category, amount]) => [
+        category,
+        Number(amount || 0),
+      ])
+      .filter(([, amount]) => amount > 0)
+      .sort(([, a], [, b]) => b - a);
+
+    if (!entries.length) {
+      return null;
+    }
+
+    return {
+      name: entries[0][0],
+      amount: entries[0][1],
+    };
+  }, [categories]);
+
+  /*
+   * ---------------------------------------------------------
+   * TOP MERCHANT
+   * ---------------------------------------------------------
+   */
+
+  const topMerchant = useMemo(() => {
+    const merchantTotals = {};
+
+    for (const transaction of transactions || []) {
+      const debit = Math.abs(
+        Number(transaction.debit || 0)
+      );
+
+      if (debit <= 0) continue;
+
+      const merchant =
+        transaction.merchant?.trim() ||
+        "Unknown";
+
+      merchantTotals[merchant] =
+        (merchantTotals[merchant] || 0) +
+        debit;
+    }
+
+    const entries = Object.entries(
+      merchantTotals
+    ).sort(([, a], [, b]) => b - a);
+
+    if (!entries.length) {
+      return null;
+    }
+
+    return {
+      name: entries[0][0],
+      amount: entries[0][1],
+    };
+  }, [transactions]);
+
+  /*
+   * ---------------------------------------------------------
+   * TREND DATA
+   * ---------------------------------------------------------
+   */
 
   const trendData = useMemo(() => {
-    return buildTrendData(transactions, trend);
+    return buildTrendData(
+      transactions,
+      trend
+    );
   }, [transactions, trend]);
+
+  /*
+   * ---------------------------------------------------------
+   * HUMAN-READABLE INSIGHTS
+   * ---------------------------------------------------------
+   */
+
+  const generatedInsights = useMemo(() => {
+    const insights = [];
+
+    const {
+      spendingChange,
+      incomeChange,
+      savingsRate,
+      averageMonthlySpending,
+    } = insightData;
+
+    if (
+      spendingChange !== null &&
+      Math.abs(spendingChange) >= 5
+    ) {
+      if (spendingChange > 0) {
+        insights.push({
+          type: "WATCH",
+          text:
+            `Spending increased by ${Math.abs(
+              spendingChange
+            ).toFixed(1)}% compared with the previous month.`,
+        });
+      } else {
+        insights.push({
+          type: "POSITIVE",
+          text:
+            `Spending decreased by ${Math.abs(
+              spendingChange
+            ).toFixed(1)}% compared with the previous month.`,
+        });
+      }
+    }
+
+    if (
+      incomeChange !== null &&
+      Math.abs(incomeChange) >= 5
+    ) {
+      if (incomeChange > 0) {
+        insights.push({
+          type: "POSITIVE",
+          text:
+            `Income increased by ${Math.abs(
+              incomeChange
+            ).toFixed(1)}% compared with the previous month.`,
+        });
+      } else {
+        insights.push({
+          type: "WATCH",
+          text:
+            `Income decreased by ${Math.abs(
+              incomeChange
+            ).toFixed(1)}% compared with the previous month.`,
+        });
+      }
+    }
+
+    if (topCategory) {
+      const categoryPercentage =
+        spending > 0
+          ? (topCategory.amount / spending) *
+            100
+          : 0;
+
+      insights.push({
+        type:
+          categoryPercentage >= 30
+            ? "WATCH"
+            : "INSIGHT",
+        text:
+          `${topCategory.name} is your largest spending category at ` +
+          `${money(topCategory.amount)} ` +
+          `(${categoryPercentage.toFixed(1)}% of total spending).`,
+      });
+    }
+
+    if (topMerchant) {
+      insights.push({
+        type: "INSIGHT",
+        text:
+          `${topMerchant.name} is your highest-spend merchant at ` +
+          `${money(topMerchant.amount)}.`,
+      });
+    }
+
+    if (savingsRate >= 20) {
+      insights.push({
+        type: "POSITIVE",
+        text:
+          `Your current savings rate is approximately ` +
+          `${savingsRate.toFixed(1)}%.`,
+      });
+    } else if (
+      income > 0 &&
+      savingsRate >= 0
+    ) {
+      insights.push({
+        type: "WATCH",
+        text:
+          `Your savings rate is approximately ` +
+          `${savingsRate.toFixed(1)}%.`,
+      });
+    } else if (
+      income > 0 &&
+      savingsRate < 0
+    ) {
+      insights.push({
+        type: "WATCH",
+        text:
+          "Your spending is currently higher than your income.",
+      });
+    }
+
+    if (
+      averageMonthlySpending > 0
+    ) {
+      insights.push({
+        type: "INSIGHT",
+        text:
+          `Your average monthly spending is ` +
+          `${money(averageMonthlySpending)}.`,
+      });
+    }
+
+    return insights.slice(0, 6);
+  }, [
+    insightData,
+    topCategory,
+    topMerchant,
+    spending,
+    income,
+  ]);
 
   return (
     <div className="page-stack">
 
+      <AccountDetails
+        details={result?.account_details || result?.account || {}}
+      />
+
+      {/* =====================================================
+          SUMMARY METRICS
+      ====================================================== */}
+
       <section className="metric-grid">
+
         <Metric
           label="Total income"
           value={shortMoney(income)}
-          detail={salary ? `${money(salary)} salary` : "All credits"}
+          detail={
+            salary
+              ? `${money(salary)} salary`
+              : "All credits"
+          }
           tone="green"
         />
 
         <Metric
-          label="Monthly expenses"
+          label="Total expenses"
           value={shortMoney(spending)}
-          detail={`${analysis?.transaction_count || result.transaction_count} transactions`}
+          detail={
+            `${analysis?.transaction_count ||
+              result.transaction_count} transactions`
+          }
           tone="red"
         />
 
         <Metric
-          label="Investments"
-          value={shortMoney(investment)}
-          detail={
-            investment
-              ? "Investment spending"
-              : "No investment transactions detected"
+          label="Savings rate"
+          value={
+            income > 0
+              ? `${insightData.savingsRate.toFixed(1)}%`
+              : "—"
           }
+          detail="Net cash flow ÷ income"
           tone="purple"
         />
 
         <Metric
           label="Net cash flow"
-          value={shortMoney(analysis?.net_cash_flow)}
+          value={shortMoney(netCashFlow)}
           detail="Income minus spending"
           tone="blue"
         />
+
       </section>
 
-      {/* CASH FLOW CHART */}
+
+      {/* =====================================================
+          ADDITIONAL INSIGHT METRICS
+      ====================================================== */}
+
+      <section className="metric-grid insight-metrics">
+
+        <Metric
+          label="Avg. monthly spending"
+          value={shortMoney(
+            insightData.averageMonthlySpending
+          )}
+          detail={
+            `${insightData.monthCount || 0} month` +
+            `${insightData.monthCount === 1 ? "" : "s"} analyzed`
+          }
+          tone="red"
+        />
+
+        <Metric
+          label="Avg. monthly income"
+          value={shortMoney(
+            insightData.averageMonthlyIncome
+          )}
+          detail="Based on uploaded statement"
+          tone="green"
+        />
+
+        <Metric
+          label="Top category"
+          value={
+            topCategory
+              ? topCategory.name
+              : "No spending data"
+            
+          }
+          detail={
+            topCategory
+              ? shortMoney(topCategory.amount)
+              : "—"
+          }
+          tone="purple"
+        />
+
+        <Metric
+          label="Top merchant"
+          value={
+            topMerchant
+              ? topMerchant.name
+              : "No spending data"
+          }
+          detail={
+            topMerchant
+              ? shortMoney(topMerchant.amount)
+              : "—"
+            
+          }
+          tone="blue"
+        />
+
+      </section>
+
+
+      {/* =====================================================
+          CASH FLOW CHART
+      ====================================================== */}
+
       <section className="panel chart-panel">
 
         <div className="panel-heading">
+
           <div>
-            <p className="eyebrow">CASH FLOW</p>
-            <h2>Income vs expenses</h2>
+            <p className="eyebrow">
+              CASH FLOW
+            </p>
+
+            <h2>
+              Income vs expenses
+            </h2>
           </div>
 
           <div className="trend-tabs">
+
             {[
               ["weekly", "Weekly"],
               ["monthly", "Monthly"],
               ["annual", "Annual"],
             ].map(([id, label]) => (
+
               <button
                 key={id}
-                className={trend === id ? "active" : ""}
-                onClick={() => setTrend(id)}
+                className={
+                  trend === id
+                    ? "active"
+                    : ""
+                }
+                onClick={() =>
+                  setTrend(id)
+                }
+                type="button"
               >
                 {label}
               </button>
+
             ))}
+
           </div>
+
         </div>
 
-        <SmoothAreaChart data={trendData} />
+        <SmoothAreaChart
+          data={trendData}
+        />
 
         <div className="legend">
+
           <span>
             <i className="legend-income" />
             Income
@@ -1938,136 +2844,253 @@ function Dashboard({
             <i className="legend-expense" />
             Expenses
           </span>
+
         </div>
 
       </section>
 
+
+      {/* =====================================================
+          BREAKDOWN + SUBSCRIPTIONS
+      ====================================================== */}
+
       <div className="two-col">
 
         <section className="panel">
+
           <div className="panel-heading compact">
+
             <div>
-              <p className="eyebrow">BREAKDOWN</p>
-              <h2>Spending by category</h2>
+              <p className="eyebrow">
+                BREAKDOWN
+              </p>
+
+              <h2>
+                Spending by category
+              </h2>
             </div>
 
             <button
               className="text-button"
-              onClick={() => setActiveTab("transactions")}
+              onClick={() =>
+                setActiveTab("transactions")
+              }
             >
               View all →
             </button>
+
           </div>
 
           <div className="category-bars">
-            {categoryEntries.map(([category, amount]) => {
-              const pct = spending
-                ? Math.min(100, (amount / spending) * 100)
-                : 0;
 
-              return (
-                <div className="category-item" key={category}>
-                  <div>
-                    <span>{category}</span>
-                    <strong>{money(amount)}</strong>
-                  </div>
+            {categoryEntries.map(
+              ([category, amount]) => {
 
-                  <div className="track">
-                    <div style={{ width: `${pct}%` }} />
+                const pct = spending
+                  ? Math.min(
+                      100,
+                      (Number(amount) /
+                        spending) *
+                        100
+                    )
+                  : 0;
+
+                return (
+                  <div
+                    className="category-item"
+                    key={category}
+                  >
+
+                    <div>
+                      <span>
+                        {category}
+                      </span>
+
+                      <strong>
+                        {money(amount)}
+                      </strong>
+                    </div>
+
+                    <div className="track">
+                      <div
+                        style={{
+                          width:
+                            `${pct}%`,
+                        }}
+                      />
+                    </div>
+
                   </div>
-                </div>
-              );
-            })}
+                );
+              }
+            )}
 
             {!categoryEntries.length && (
-              <p className="muted">No spending categories yet.</p>
+              <p className="muted">
+                No spending categories yet.
+              </p>
             )}
+
           </div>
+
         </section>
 
+
         <section className="panel">
+
           <div className="panel-heading compact">
+
             <div>
-              <p className="eyebrow">RECURRING</p>
-              <h2>Detected subscriptions</h2>
+              <p className="eyebrow">
+                RECURRING
+              </p>
+
+              <h2>
+                Detected subscriptions
+              </h2>
             </div>
 
             <button
               className="text-button"
-              onClick={() => setActiveTab("subscriptions")}
+              onClick={() =>
+                setActiveTab("subscriptions")
+              }
             >
               View all →
             </button>
+
           </div>
 
-          {subscriptions.slice(0, 4).map((s) => (
-            <div className="subscription-mini" key={s.merchant}>
-              <div className="avatar">
-                {(s.merchant || "?").charAt(0)}
+          {subscriptions
+            .slice(0, 4)
+            .map((s) => (
+
+              <div
+                className="subscription-mini"
+                key={s.merchant}
+              >
+
+                <div className="avatar">
+                  {(s.merchant || "?")
+                    .charAt(0)}
+                </div>
+
+                <div>
+                  <strong>
+                    {s.merchant}
+                  </strong>
+
+                  <small>
+                    {s.charge_count} charges ·{" "}
+                    {s.category}
+                  </small>
+                </div>
+
+                <b>
+                  {money(s.amount)}
+                </b>
+
               </div>
 
-              <div>
-                <strong>{s.merchant}</strong>
-                <small>
-                  {s.charge_count} charges · {s.category}
-                </small>
-              </div>
-
-              <b>{money(s.amount)}</b>
-            </div>
-          ))}
+            ))}
 
           {!subscriptions.length && (
             <p className="muted">
               No AUTOPAY subscriptions detected.
             </p>
           )}
+
         </section>
 
       </div>
 
+
+      {/* =====================================================
+          FINANCIAL INSIGHTS
+      ====================================================== */}
+
       <section className="panel insights-panel">
+
         <div className="panel-heading compact">
+
           <div>
-            <p className="eyebrow">AI ANALYSIS</p>
-            <h2>Financial insights</h2>
+            <p className="eyebrow">
+              FINANCIAL HEALTH
+            </p>
+
+            <h2>
+              Financial insights
+            </h2>
           </div>
 
           <button
             className="text-button"
-            onClick={() => setActiveTab("ask")}
+            onClick={() =>
+              setActiveTab("ask")
+            }
           >
             Ask FinMan →
           </button>
+
         </div>
 
-        <p className="insight-lead">
-          {result.insights?.summary ||
-            "FinMan has analyzed your statement and prepared an overview."}
-        </p>
+
+        <div className="insight-summary">
+
+          <div className="insight-summary-icon">
+            ✦
+          </div>
+
+          <div>
+            <strong>
+              {insightData.savingsRate >= 20
+                ? "Your cash flow looks healthy."
+                : insightData.savingsRate >= 0
+                ? "There is room to improve your savings."
+                : "Your spending currently exceeds your income."}
+            </strong>
+
+            <p>
+              FinMan analyzed your uploaded
+              transactions to identify spending
+              patterns and changes over time.
+            </p>
+          </div>
+
+        </div>
+
 
         <div className="insight-grid">
-          {(result.insights?.areas_to_watch || [])
-            .slice(0, 3)
-            .map((item, i) => (
-              <div className="insight-card" key={i}>
-                <span>WATCH</span>
-                <p>{item}</p>
-              </div>
-            ))}
 
-          {(result.insights?.positive_observations || [])
-            .slice(0, 3)
-            .map((item, i) => (
+          {generatedInsights.map(
+            (item, index) => (
+
               <div
-                className="insight-card positive"
-                key={`p${i}`}
+                className={
+                  `insight-card ${
+                    item.type === "POSITIVE"
+                      ? "positive"
+                      : ""
+                  }`
+                }
+                key={index}
               >
-                <span>POSITIVE</span>
-                <p>{item}</p>
+
+                <span>
+                  {item.type}
+                </span>
+
+                <p>
+                  {item.text}
+                </p>
+
               </div>
-            ))}
+
+            )
+          )}
+
         </div>
+
       </section>
 
     </div>

@@ -10,6 +10,142 @@ SUPPORTED_EXTENSIONS = {
 
 
 # ============================================================
+# Local account metadata extraction
+# ============================================================
+
+_ACCOUNT_LABELS = {
+    "account_number": (
+        "account number", "account no", "account no.", "a/c no",
+        "a/c no.", "a/c number", "ac no", "ac no.", "account #",
+    ),
+    "account_holder": (
+        "account holder", "account name", "customer name",
+        "name of account holder", "name",
+    ),
+    "account_type": (
+        "account type", "a/c type", "ac type",
+    ),
+    "bank_name": (
+        "bank name", "bank",
+    ),
+    "ifsc": (
+        "ifsc", "ifsc code",
+    ),
+}
+
+
+def _clean_metadata_value(value):
+    if value is None or pd.isna(value):
+        return ""
+    return " ".join(str(value).replace("\n", " ").split()).strip()
+
+
+def _normalize_metadata_label(value):
+    value = _clean_metadata_value(value).lower()
+    return value.replace(":", "").strip()
+
+
+def _looks_like_account_number(value):
+    value = _clean_metadata_value(value)
+    if not value:
+        return False
+    compact = value.replace(" ", "").replace("-", "")
+    return bool(__import__("re").fullmatch(r"[A-Za-z0-9]{6,24}", compact))
+
+
+def extract_account_details(df):
+    """Extract account metadata locally from the statement header.
+
+    This function runs on the raw spreadsheet dataframe and must be called
+    before PII sanitization or any Gemini request. It intentionally returns
+    only metadata; it is never passed to the LLM.
+    """
+    result = {
+        "account_holder": "",
+        "account_number": "",
+        "account_type": "",
+        "bank_name": "",
+        "ifsc": "",
+    }
+
+    header_info = detect_transaction_header(df)
+    stop_row = header_info["row_index"] if header_info else min(len(df), 80)
+    search_df = df.iloc[:stop_row]
+
+    import re
+
+    for row_index in range(len(search_df)):
+        row = search_df.iloc[row_index].tolist()
+        for col_index, cell in enumerate(row):
+            raw_cell = _clean_metadata_value(cell)
+            label = _normalize_metadata_label(cell)
+            if not label:
+                continue
+
+            # Handle inline forms such as:
+            #   Account Number: 1234567890
+            #   IFSC: HDFC0001234
+            for field, aliases in _ACCOUNT_LABELS.items():
+                if result[field]:
+                    continue
+                for alias in aliases:
+                    prefix = alias + ":"
+                    if label.startswith(prefix):
+                        inline_value = raw_cell[len(prefix):].strip()
+                        if inline_value and (
+                            field != "account_number"
+                            or _looks_like_account_number(inline_value)
+                        ):
+                            result[field] = inline_value
+                            break
+                if result[field]:
+                    break
+
+            if label in {alias for aliases in _ACCOUNT_LABELS.values() for alias in aliases}:
+                matched_field = next(
+                    (field for field, aliases in _ACCOUNT_LABELS.items() if label in aliases),
+                    None,
+                )
+            else:
+                matched_field = None
+
+            if not matched_field or result[matched_field]:
+                continue
+
+            candidates = []
+            if col_index + 1 < len(row):
+                candidates.append(row[col_index + 1])
+            if col_index + 2 < len(row):
+                candidates.append(row[col_index + 2])
+
+            for candidate in candidates:
+                value = _clean_metadata_value(candidate)
+                if not value:
+                    continue
+                if matched_field == "account_number" and not _looks_like_account_number(value):
+                    continue
+                result[matched_field] = value
+                break
+
+    # Some statements put metadata in a two-column label/value arrangement
+    # but omit a recognizable label. Look for a likely account number only
+    # in the pre-transaction header region as a final local fallback.
+    if not result["account_number"]:
+        import re
+        for row_index in range(len(search_df)):
+            for cell in search_df.iloc[row_index].tolist():
+                value = _clean_metadata_value(cell)
+                compact = value.replace(" ", "").replace("-", "")
+                if re.fullmatch(r"\d{8,18}", compact):
+                    result["account_number"] = value
+                    break
+            if result["account_number"]:
+                break
+
+    return result
+
+
+# ============================================================
 # Transaction column aliases
 # ============================================================
 
@@ -71,6 +207,7 @@ TRANSACTION_COLUMN_ALIASES = {
 def read_statement(
     filename,
     content,
+    extract_transactions=True,
 ):
     """
     Read a CSV/XLSX bank statement and extract
@@ -107,9 +244,10 @@ def read_statement(
             engine="openpyxl",
         )
 
-    return extract_transaction_table(
-        df
-    )
+    if not extract_transactions:
+        return df
+
+    return extract_transaction_table(df)
 
 
 # ============================================================
